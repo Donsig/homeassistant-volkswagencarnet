@@ -189,3 +189,95 @@ def test_newest_dataset_falls_back_to_name_sort():
         {"name": "2026-05-31T09-00.zip"},
     ]
     assert EUDataActAPI._newest_dataset(datasets) == "2026-05-31T09-00.zip"
+
+
+# --- entity value helpers ---------------------------------------------------
+# Test native_value and is_on logic directly without a full HA setup.
+# We subclass the coordinator to inject data without networking.
+
+from unittest.mock import MagicMock
+
+from custom_components.volkswagencarnet.eu_data_act import (
+    EU_SENSORS,
+    EU_BINARY_SENSORS,
+    EUDataActSensor,
+    EUDataActBinarySensor,
+    EUDataActSensorDescriptor,
+    EUDataActBinarySensorDescriptor,
+    FIELD_SOC,
+    FIELD_HV_SOC,
+    FIELD_PLUG_STATE,
+    FIELD_CHARGING_STATE,
+    SensorDeviceClass,
+    SensorStateClass,
+    BinarySensorDeviceClass,
+)
+
+
+def _make_sensor(descriptor: EUDataActSensorDescriptor, data: dict) -> EUDataActSensor:
+    coord = MagicMock()
+    coord.data = data
+    entity = EUDataActSensor.__new__(EUDataActSensor)
+    entity.coordinator = coord
+    entity._vin = "VIN0"
+    entity._fields = descriptor.fields
+    return entity
+
+
+def _make_binary(descriptor: EUDataActBinarySensorDescriptor, data: dict) -> EUDataActBinarySensor:
+    coord = MagicMock()
+    coord.data = data
+    entity = EUDataActBinarySensor.__new__(EUDataActBinarySensor)
+    entity.coordinator = coord
+    entity._vin = "VIN0"
+    entity._fields = descriptor.fields
+    entity._true_values = descriptor.true_values
+    return entity
+
+
+def test_sensor_soc_primary_field():
+    soc_desc = next(d for d in EU_SENSORS if d.key == "soc")
+    sensor = _make_sensor(soc_desc, {FIELD_SOC: "75"})
+    assert sensor.native_value == 75.0
+
+
+def test_sensor_soc_fallback_to_hv_soc():
+    soc_desc = next(d for d in EU_SENSORS if d.key == "soc")
+    sensor = _make_sensor(soc_desc, {FIELD_HV_SOC: "82"})
+    assert sensor.native_value == 82.0
+
+
+def test_sensor_no_data_returns_none():
+    soc_desc = next(d for d in EU_SENSORS if d.key == "soc")
+    sensor = _make_sensor(soc_desc, {})
+    assert sensor.native_value is None
+
+
+def test_sensor_string_value_returned_as_is():
+    state_desc = next(d for d in EU_SENSORS if d.key == "charging_state")
+    sensor = _make_sensor(state_desc, {FIELD_CHARGING_STATE: "charging"})
+    assert sensor.native_value == "charging"
+
+
+def test_binary_plug_connected_true():
+    plug_desc = next(d for d in EU_BINARY_SENSORS if d.key == "plug_connected")
+    binary = _make_binary(plug_desc, {FIELD_PLUG_STATE: "connected"})
+    assert binary.is_on is True
+
+
+def test_binary_plug_connected_false():
+    plug_desc = next(d for d in EU_BINARY_SENSORS if d.key == "plug_connected")
+    binary = _make_binary(plug_desc, {FIELD_PLUG_STATE: "disconnected"})
+    assert binary.is_on is False
+
+
+def test_binary_no_data_returns_none():
+    plug_desc = next(d for d in EU_BINARY_SENSORS if d.key == "plug_connected")
+    binary = _make_binary(plug_desc, {})
+    assert binary.is_on is None
+
+
+def test_binary_case_insensitive():
+    plug_desc = next(d for d in EU_BINARY_SENSORS if d.key == "plug_connected")
+    binary = _make_binary(plug_desc, {FIELD_PLUG_STATE: "CONNECTED"})
+    assert binary.is_on is True
