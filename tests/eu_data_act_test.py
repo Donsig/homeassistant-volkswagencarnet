@@ -104,3 +104,88 @@ def test_login_fields_template_model_overrides_form():
     assert fields["hmac"] == "hmac_from_js"
     assert fields["relayState"] == "relay_from_js"
     assert fields["_csrf"] == "csrf_from_form"
+
+
+# --- dataset parsing ---------------------------------------------------------
+
+def _make_zip(doc: dict) -> bytes:
+    """Build an in-memory zip containing a single vehicle_data.json."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("vehicle_data.json", json.dumps(doc))
+    return buf.getvalue()
+
+
+def test_parse_dataset_basic():
+    doc = {
+        "vin": "WVWZZZ123",
+        "Data": [
+            {"key": "ffff", "dataFieldName": "state_of_charge", "value": "73"},
+            {"key": "aaaa", "dataFieldName": "mileage", "value": "12345"},
+            {"key": "bbbb", "dataFieldName": "cruising_range_combined", "value": "210"},
+        ],
+    }
+    result = EUDataActAPI._parse_dataset(_make_zip(doc))
+    assert result["state_of_charge"] == "73"
+    assert result["mileage"] == "12345"
+    assert result["cruising_range_combined"] == "210"
+
+
+def test_parse_dataset_smallest_key_wins():
+    """When a field appears twice, the entry with smallest key wins."""
+    doc = {
+        "Data": [
+            {"key": "ffff", "dataFieldName": "state_of_charge", "value": "73"},
+            {"key": "0001", "dataFieldName": "state_of_charge", "value": "80"},
+        ]
+    }
+    result = EUDataActAPI._parse_dataset(_make_zip(doc))
+    assert result["state_of_charge"] == "80"  # "0001" < "ffff"
+
+
+def test_parse_dataset_empty_field_name_skipped():
+    doc = {"Data": [{"key": "aaaa", "dataFieldName": "", "value": "ignored"}]}
+    result = EUDataActAPI._parse_dataset(_make_zip(doc))
+    assert result == {}
+
+
+def test_parse_dataset_nested_field():
+    doc = {"Data": [{"key": "aaaa", "dataFieldName": "settings.target_soc", "value": "90"}]}
+    result = EUDataActAPI._parse_dataset(_make_zip(doc))
+    assert result["settings.target_soc"] == "90"
+
+
+# --- newest_dataset ----------------------------------------------------------
+
+def test_newest_dataset_picks_latest():
+    datasets = [
+        {"name": "2026-05-31T08-00.zip", "createdOn": "2026-05-31T08:00:00Z"},
+        {"name": "2026-05-31T09-00.zip", "createdOn": "2026-05-31T09:00:00Z"},
+    ]
+    assert EUDataActAPI._newest_dataset(datasets) == "2026-05-31T09-00.zip"
+
+
+def test_newest_dataset_skips_no_content():
+    datasets = [
+        {"name": "2026-05-31T09-00.zip", "createdOn": "2026-05-31T09:00:00Z"},
+        {"name": "2026-05-31T09-15_no_content_found.zip", "createdOn": "2026-05-31T09:15:00Z"},
+    ]
+    assert EUDataActAPI._newest_dataset(datasets) == "2026-05-31T09-00.zip"
+
+
+def test_newest_dataset_all_no_content():
+    datasets = [{"name": "2026-05-31T09-00_no_content_found.zip"}]
+    assert EUDataActAPI._newest_dataset(datasets) is None
+
+
+def test_newest_dataset_empty():
+    assert EUDataActAPI._newest_dataset([]) is None
+
+
+def test_newest_dataset_falls_back_to_name_sort():
+    """When createdOn is absent, use filename for ordering."""
+    datasets = [
+        {"name": "2026-05-31T08-00.zip"},
+        {"name": "2026-05-31T09-00.zip"},
+    ]
+    assert EUDataActAPI._newest_dataset(datasets) == "2026-05-31T09-00.zip"

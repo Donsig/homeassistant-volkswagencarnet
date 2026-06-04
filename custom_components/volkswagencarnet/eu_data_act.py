@@ -208,6 +208,60 @@ class EUDataActAPI:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    # ── Dataset helpers (static — easy to unit test) ──────────────────────────
+
+    @staticmethod
+    def _newest_dataset(datasets: list[dict]) -> str | None:
+        """Return the name of the most recent dataset that contains data.
+
+        Skips files ending in ``_no_content_found.zip`` (portal placeholder
+        when the vehicle is sleeping and has not produced a snapshot yet).
+        Comparison key is ``createdOn`` when present, falling back to the
+        filename string.
+        """
+        best: dict | None = None
+        for d in datasets:
+            name = d.get("name", "")
+            if name.lower().endswith(NO_CONTENT_SUFFIX):
+                continue
+            sort_key = d.get("createdOn") or name
+            best_key = (best.get("createdOn") or best.get("name", "")) if best else ""
+            if best is None or sort_key > best_key:
+                best = d
+        return best["name"] if best else None
+
+    @staticmethod
+    def _parse_dataset(data: bytes) -> dict[str, str]:
+        """Unzip a dataset archive and decode its flat data-point list.
+
+        Returns a ``{dataFieldName: value}`` mapping.  When the same field
+        name appears multiple times (the portal merges several report
+        snapshots), the entry with the **smallest** key UUID is kept —
+        matching the evcc and ioBroker reference implementations.
+        """
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            json_name = next(
+                (n for n in zf.namelist() if n.lower().endswith(".json")),
+                None,
+            )
+            if json_name is None:
+                raise UpdateFailed("No JSON file found inside dataset zip")
+            raw = zf.read(json_name)
+
+        doc = json.loads(raw)
+        result: dict[str, str] = {}
+        winner_keys: dict[str, str] = {}  # field_name → winning UUID key
+        for point in doc.get("Data", []):
+            field = point.get("dataFieldName", "")
+            key = point.get("key", "")
+            value = str(point.get("value", ""))
+            if not field:
+                continue
+            if field not in winner_keys or key < winner_keys[field]:
+                result[field] = value
+                winner_keys[field] = key
+        return result
+
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
