@@ -60,6 +60,18 @@ from .const import (
     UNDO_UPDATE_LISTENER,
     UPDATE_CALLBACK,
     SERVICE_UPDATE_SCHEDULE,
+    CONF_DATA_SOURCE,
+    DATA_SOURCE_EU_DATA_ACT,
+    CONF_BRAND,
+    EUDA_COORDINATOR,
+    EUDA_API,
+    DATA_SOURCE_KEY,
+)
+from .eu_data_act import (
+    EUDataActAPI,
+    EUDataActCoordinator,
+    ConsentRequired,
+    LoginError,
 )
 from .services import (
     SchedulerService,
@@ -75,8 +87,56 @@ def unload_services(hass: HomeAssistant):
     hass.services.async_remove(DOMAIN, SERVICE_UPDATE_SCHEDULE)
 
 
+async def async_setup_eu_data_act_entry(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """Set up the EU Data Act data source."""
+    scan_interval_conf = entry.data.get(CONF_SCAN_INTERVAL, 15)
+    update_interval = timedelta(minutes=max(scan_interval_conf, 15))
+
+    api = EUDataActAPI(
+        brand=entry.data.get(CONF_BRAND, "Volkswagen"),
+        username=entry.data[CONF_USERNAME],
+        password=entry.data[CONF_PASSWORD],
+    )
+
+    try:
+        await api.login()
+    except (ConsentRequired, LoginError) as err:
+        _LOGGER.warning("EU Data Act login failed: %s", err)
+        await api.close()
+        entry.async_start_reauth(hass)
+        return False
+
+    vin = entry.data[CONF_VEHICLE].upper()
+    coordinator = EUDataActCoordinator(hass, entry, api, vin, update_interval)
+
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        await api.close()
+        raise
+
+    hass.data[DOMAIN][entry.entry_id] = {
+        DATA_SOURCE_KEY: DATA_SOURCE_EU_DATA_ACT,
+        EUDA_COORDINATOR: coordinator,
+        EUDA_API: api,
+        UNDO_UPDATE_LISTENER: entry.add_update_listener(_async_update_listener),
+    }
+
+    hass.bus.async_listen_once(
+        EVENT_HOMEASSISTANT_STOP,
+        lambda _: hass.async_create_task(api.close()),
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "binary_sensor"])
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Perform Volkswagen Connect component setup."""
+    if entry.data.get(CONF_DATA_SOURCE) == DATA_SOURCE_EU_DATA_ACT:
+        return await async_setup_eu_data_act_entry(hass, entry)
 
     scan_interval_conf = entry.options.get(
         CONF_SCAN_INTERVAL, entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_UPDATE_INTERVAL)
@@ -236,8 +296,30 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     return True
 
 
+async def async_unload_eu_data_act_entry(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> bool:
+    """Unload the EU Data Act data source."""
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    entry_data[UNDO_UPDATE_LISTENER]()
+
+    unloaded = await hass.config_entries.async_unload_platforms(
+        entry, ["sensor", "binary_sensor"]
+    )
+
+    if unloaded:
+        api: EUDataActAPI = entry_data[EUDA_API]
+        await api.close()
+        hass.data[DOMAIN].pop(entry.entry_id)
+
+    return unloaded
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    if hass.data[DOMAIN].get(entry.entry_id, {}).get(DATA_SOURCE_KEY) == DATA_SOURCE_EU_DATA_ACT:
+        return await async_unload_eu_data_act_entry(hass, entry)
+
     _LOGGER.debug("Removing update listener")
     hass.data[DOMAIN][entry.entry_id][UNDO_UPDATE_LISTENER]()
 
