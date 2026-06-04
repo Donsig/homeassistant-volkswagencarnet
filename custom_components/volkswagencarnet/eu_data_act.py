@@ -500,3 +500,207 @@ class EUDataActAPI:
             download_url, {"filename": name, "type": "partial"}
         )
         return self._parse_dataset(raw)
+
+
+# ── Coordinator ───────────────────────────────────────────────────────────────
+
+class EUDataActCoordinator(DataUpdateCoordinator):
+    """Manages polling the EU Data Act portal for one vehicle."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        api: EUDataActAPI,
+        vin: str,
+        update_interval: timedelta,
+    ) -> None:
+        self.api = api
+        self.vin = vin
+        self.entry = entry
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"EU Data Act {vin}",
+            update_interval=update_interval,
+        )
+
+    async def _async_update_data(self) -> dict[str, str]:
+        try:
+            return await self.api.status(self.vin)
+        except ConsentRequired as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except LoginError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
+        except UpdateFailed:
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            raise UpdateFailed(str(err)) from err
+
+
+# ── Entity descriptors ────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class EUDataActSensorDescriptor:
+    """Describes one sensor sourced from the EU Data Act portal."""
+    key: str
+    fields: tuple[str, ...]   # checked in order; first non-empty value used
+    name: str
+    unit: str | None
+    device_class: SensorDeviceClass | None
+    state_class: SensorStateClass | None
+
+
+@dataclass(frozen=True)
+class EUDataActBinarySensorDescriptor:
+    """Describes one binary sensor sourced from the EU Data Act portal."""
+    key: str
+    fields: tuple[str, ...]
+    name: str
+    device_class: BinarySensorDeviceClass | None
+    true_values: frozenset[str]   # lower-cased values that map to True
+
+
+EU_SENSORS: list[EUDataActSensorDescriptor] = [
+    EUDataActSensorDescriptor(
+        key="soc",
+        fields=(FIELD_SOC, FIELD_HV_SOC),
+        name="Battery Level",
+        unit=PERCENTAGE,
+        device_class=SensorDeviceClass.BATTERY,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    EUDataActSensorDescriptor(
+        key="range",
+        fields=(FIELD_RANGE, FIELD_RANGE_PRIMARY),
+        name="Range",
+        unit=UnitOfLength.KILOMETERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    EUDataActSensorDescriptor(
+        key="odometer",
+        fields=(FIELD_ODOMETER,),
+        name="Odometer",
+        unit=UnitOfLength.KILOMETERS,
+        device_class=SensorDeviceClass.DISTANCE,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
+    EUDataActSensorDescriptor(
+        key="target_soc",
+        fields=(FIELD_TARGET_SOC,),
+        name="Charge Limit",
+        unit=PERCENTAGE,
+        device_class=SensorDeviceClass.BATTERY,
+        state_class=SensorStateClass.MEASUREMENT,
+    ),
+    EUDataActSensorDescriptor(
+        key="charging_state",
+        fields=(FIELD_CHARGING_STATE,),
+        name="Charging State",
+        unit=None,
+        device_class=None,
+        state_class=None,
+    ),
+]
+
+EU_BINARY_SENSORS: list[EUDataActBinarySensorDescriptor] = [
+    EUDataActBinarySensorDescriptor(
+        key="plug_connected",
+        fields=(FIELD_PLUG_STATE,),
+        name="Plug Connected",
+        device_class=BinarySensorDeviceClass.PLUG,
+        true_values=frozenset({"connected"}),
+    ),
+    EUDataActBinarySensorDescriptor(
+        key="charging",
+        fields=(FIELD_CHARGING_STATE,),
+        name="Charging",
+        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
+        true_values=frozenset({"charging"}),
+    ),
+]
+
+
+# ── Entity base ───────────────────────────────────────────────────────────────
+
+class _EUDataActEntity(CoordinatorEntity):
+    """Base entity for all EU Data Act sensors."""
+
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: EUDataActCoordinator,
+        vin: str,
+        name: str,
+        key: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._vin = vin
+        self._attr_name = name
+        self._attr_unique_id = f"{vin}-euda-{key}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._vin)},
+            manufacturer="Volkswagen",
+            serial_number=self._vin,
+        )
+
+
+# ── Concrete entity classes ───────────────────────────────────────────────────
+
+class EUDataActSensor(_EUDataActEntity, SensorEntity):
+    """Sensor reading a field from the EU Data Act dataset."""
+
+    def __init__(
+        self,
+        coordinator: EUDataActCoordinator,
+        vin: str,
+        descriptor: EUDataActSensorDescriptor,
+    ) -> None:
+        super().__init__(coordinator, vin, descriptor.name, f"sensor-{descriptor.key}")
+        self._fields = descriptor.fields
+        self._attr_native_unit_of_measurement = descriptor.unit
+        self._attr_device_class = descriptor.device_class
+        self._attr_state_class = descriptor.state_class
+
+    @property
+    def native_value(self) -> float | str | None:
+        data: dict[str, str] = self.coordinator.data or {}
+        for field in self._fields:
+            raw = data.get(field)
+            if raw:
+                try:
+                    return float(raw)
+                except (ValueError, TypeError):
+                    return raw
+        return None
+
+
+class EUDataActBinarySensor(_EUDataActEntity, BinarySensorEntity):
+    """Binary sensor reading a field from the EU Data Act dataset."""
+
+    def __init__(
+        self,
+        coordinator: EUDataActCoordinator,
+        vin: str,
+        descriptor: EUDataActBinarySensorDescriptor,
+    ) -> None:
+        super().__init__(
+            coordinator, vin, descriptor.name, f"binary-{descriptor.key}"
+        )
+        self._fields = descriptor.fields
+        self._attr_device_class = descriptor.device_class
+        self._true_values = descriptor.true_values
+
+    @property
+    def is_on(self) -> bool | None:
+        data: dict[str, str] = self.coordinator.data or {}
+        for field in self._fields:
+            raw = data.get(field)
+            if raw is not None:
+                return raw.lower() in self._true_values
+        return None
