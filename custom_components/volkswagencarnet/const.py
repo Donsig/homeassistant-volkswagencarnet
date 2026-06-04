@@ -44,3 +44,15 @@ COMPONENTS = {
 }
 
 SERVICE_UPDATE_SCHEDULE = "update_schedule"
+
+# EU Data Act data source
+CONF_DATA_SOURCE = "data_source"
+DATA_SOURCE_LEGACY = "legacy"
+DATA_SOURCE_EU_DATA_ACT = "eu_data_act"
+
+CONF_BRAND = "brand"
+
+# Keys used in hass.data entries for EU Data Act
+EUDA_COORDINATOR = "euda_coordinator"
+EUDA_API = "euda_api"
+DATA_SOURCE_KEY = "data_source_key"   # marker stored in hass.data to identify EU Data Act entries
