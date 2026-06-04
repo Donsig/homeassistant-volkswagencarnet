@@ -184,6 +184,16 @@ def _login_fields(html: str, page_url: str) -> tuple[str, dict[str, str]]:
     return action, fields
 
 
+# ── Custom exceptions ─────────────────────────────────────────────────────────
+
+class LoginError(Exception):
+    """Authentication against the VW Identity service failed."""
+
+
+class ConsentRequired(LoginError):
+    """The portal's one-time browser consent has not been completed."""
+
+
 # ── API client ────────────────────────────────────────────────────────────────
 
 class EUDataActAPI:
@@ -200,10 +210,15 @@ class EUDataActAPI:
         self._username = username
         self._password = password
         self._brand = brand
+        self._brand_cfg = BRANDS.get(brand, BRANDS["Volkswagen"])
         self._session: aiohttp.ClientSession | None = None
-        self._authenticated = False
+        self._logged_in = False
 
-    async def _get_session(self) -> aiohttp.ClientSession:
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
         return self._session
@@ -262,93 +277,226 @@ class EUDataActAPI:
                 winner_keys[field] = key
         return result
 
-    async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+    # ── Auth ──────────────────────────────────────────────────────────────────
 
-    async def login(self) -> None:
-        """Perform OIDC form login against identity.vwgroup.io."""
-        session = await self._get_session()
-        brand_cfg = BRANDS.get(self._brand, BRANDS["Volkswagen"])
-        client_id = brand_cfg["client_id"]
-
+    def _authorize_url(self) -> str:
         params = {
-            "client_id": client_id,
-            "redirect_uri": OIDC_REDIRECT_URI,
+            "client_id": self._brand_cfg["client_id"],
             "response_type": "code",
             "scope": OIDC_SCOPE,
+            "state": f"de__en__{self._brand_cfg['state_brand']}",
+            "redirect_uri": OIDC_REDIRECT_URI,
+            "prompt": "login",
         }
-        auth_url = OIDC_AUTHORIZE_URL + "?" + urlencode(params)
+        return f"{OIDC_AUTHORIZE_URL}?{urlencode(params)}"
 
-        async with session.get(auth_url, allow_redirects=True) as resp:
-            html = await resp.text()
+    async def login(self) -> None:
+        """Run the OIDC form login and store session cookies.
+
+        Raises LoginError on failure.
+        Raises ConsentRequired if the portal's one-time browser consent
+        has not been completed.
+        """
+        session = self._get_session()
+
+        # Prime portal session (best effort — sets AEM cookies)
+        try:
+            async with session.get(BASE_URL + "/", allow_redirects=True):
+                pass
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        # Step 1: GET IdP authorize → email form
+        async with session.get(
+            self._authorize_url(), allow_redirects=True
+        ) as resp:
+            resp.raise_for_status()
             page_url = str(resp.url)
+            html = await resp.text()
 
-        action, fields = _login_fields(html, page_url)
+        email_action, fields = _login_fields(html, page_url)
+        if not fields.get("hmac") or not fields.get("_csrf"):
+            raise LoginError(
+                "Could not parse email form (portal layout may have changed)"
+            )
         fields["email"] = self._username
 
+        # Step 2: POST email → password form
         async with session.post(
-            action,
-            data={**fields},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            allow_redirects=True,
+            email_action, data=fields, allow_redirects=True
         ) as resp:
-            html = await resp.text()
             page_url = str(resp.url)
+            html = await resp.text()
 
-        if "password" in html.lower():
-            action, fields = _login_fields(html, page_url)
-            fields["password"] = self._password
+        pw_action, fields = _login_fields(html, page_url)
+        if not fields.get("hmac") or not fields.get("_csrf"):
+            raise LoginError(
+                "Could not parse password form (check email address)"
+            )
+        fields["email"] = self._username
+        fields["password"] = self._password
 
-            async with session.post(
-                action,
-                data={**fields},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                allow_redirects=True,
-            ) as resp:
-                if resp.status >= 400:
-                    raise ConfigEntryAuthFailed(
-                        f"EU Data Act login failed: HTTP {resp.status}"
-                    )
+        # Step 3: POST password → follows redirect chain to portal
+        async with session.post(
+            pw_action, data=fields, allow_redirects=True
+        ) as resp:
+            landing_url = str(resp.url)
+            landing_html = await resp.text()
+            status = resp.status
 
-        self._authenticated = True
-        _LOGGER.debug("EU Data Act login succeeded")
+        if status >= 400:
+            raise LoginError(f"Login failed (HTTP {status})")
 
-    async def get_vehicle_data(self, vin: str) -> dict[str, Any]:
-        """Fetch and unpack the latest data snapshot ZIP for a vehicle."""
-        if not self._authenticated:
+        parsed = urlparse(landing_url)
+        path = parsed.path
+
+        if "consent" in path or "consent-screen" in landing_html.lower():
+            raise ConsentRequired(
+                "EU Data Act portal requires one-time browser consent. "
+                "Open https://eu-data-act.drivesomethinggreater.com/ in a "
+                "browser, log in with your We Connect credentials, accept "
+                "the consent screen, link your vehicle and enable the "
+                "continuous data request (15 min interval)."
+            )
+        if "signin-service" in path or "/error" in path:
+            raise LoginError(f"Login did not complete (landed at {landing_url})")
+        if parsed.netloc != PORTAL_HOST:
+            raise LoginError(
+                f"Login ended at unexpected host: {parsed.netloc}"
+            )
+
+        self._logged_in = True
+        _LOGGER.debug("EU Data Act login successful")
+
+    async def _get_json(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        _retried: bool = False,
+    ) -> Any:
+        """GET a JSON endpoint, re-authenticating once on auth failure.
+
+        Also handles Adobe AEM session expiry (5xx + HTML body).
+        """
+        session = self._get_session()
+        async with session.get(
+            url, headers=headers or {}, allow_redirects=True
+        ) as resp:
+            body = await resp.text()
+            http_status = resp.status
+
+        # AEM session expiry returns 5xx with an HTML body
+        aem_expired = http_status >= 500 and body.lstrip().startswith("<")
+
+        if (http_status in (401, 403) or aem_expired) and not _retried:
+            _LOGGER.debug(
+                "EU Data Act: re-logging in after HTTP %s", http_status
+            )
+            self._logged_in = False
+            await self.login()
+            return await self._get_json(url, headers, _retried=True)
+
+        if http_status >= 400:
+            raise UpdateFailed(
+                f"EU Data Act GET {url} returned HTTP {http_status}"
+            )
+        return json.loads(body)
+
+    async def _download_raw(
+        self,
+        url: str,
+        headers: dict[str, str],
+        *,
+        _retried: bool = False,
+    ) -> bytes:
+        """Download binary content, re-authenticating once on auth failure."""
+        session = self._get_session()
+        async with session.get(
+            url, headers=headers, allow_redirects=True
+        ) as resp:
+            body = await resp.read()
+            http_status = resp.status
+
+        aem_expired = http_status >= 500 and body[:1] == b"<"
+        if (http_status in (401, 403) or aem_expired) and not _retried:
+            self._logged_in = False
+            await self.login()
+            return await self._download_raw(url, headers, _retried=True)
+
+        if http_status >= 400:
+            raise UpdateFailed(f"EU Data Act download returned HTTP {http_status}")
+        return body
+
+    # ── Data API ──────────────────────────────────────────────────────────────
+
+    async def vehicles(self) -> list[dict[str, str]]:
+        """Return list of ``{vin, name}`` dicts for vehicles on the portal."""
+        if not self._logged_in:
+            await self.login()
+        data = await self._get_json(
+            f"{BASE_URL}/proxy_api/consent/me/vehicles?viewPosition=FRONT_LEFT",
+            {"Accept": "application/json"},
+        )
+        raw: list[dict] = data if isinstance(data, list) else data.get("vehicles", [])
+        result = []
+        for v in raw:
+            vin = v.get("vin") or v.get("vehicleIdentificationNumber", "")
+            if not vin or len(vin) != 17:
+                continue
+            name = (
+                v.get("nickName")
+                or v.get("vehicleNickname")
+                or v.get("nickname")
+                or v.get("modelName")
+                or vin
+            )
+            result.append({"vin": vin, "name": str(name)})
+        return result
+
+    async def status(self, vin: str) -> dict[str, str]:
+        """Download the newest dataset for *vin* and return decoded fields."""
+        if not self._logged_in:
             await self.login()
 
-        session = await self._get_session()
-        url = f"{BASE_URL}/api/v1/vehicles/{vin}/data"
+        # 1. Get the data-request identifier for this VIN
+        meta = await self._get_json(
+            f"{BASE_URL}/proxy_api/euda-apim/datarequest/vehicles/{vin}/metadata/partial",
+            {"Accept": "application/json"},
+        )
+        identifier = meta.get("Identifier", "")
+        if not identifier:
+            raise UpdateFailed(
+                "No data request configured for vehicle. "
+                "Enable the continuous data request on the EU Data Act portal."
+            )
 
-        async with session.get(url) as resp:
-            if resp.status in (401, 403):
-                self._authenticated = False
-                raise ConfigEntryAuthFailed("EU Data Act session expired")
-            if resp.status != 200:
-                raise UpdateFailed(f"EU Data Act returned HTTP {resp.status}")
+        # 2. List available datasets
+        list_url = (
+            f"{BASE_URL}/proxy_api/euda-apim/datadelivery"
+            f"/vehicles/{vin}/{identifier}/list"
+        )
+        datasets = await self._get_json(
+            list_url, {"Accept": "application/json", "type": "partial"}
+        )
+        if not isinstance(datasets, list):
+            datasets = datasets.get("files", [])
 
-            content_type = resp.headers.get("Content-Type", "")
-            if "zip" in content_type or "octet-stream" in content_type:
-                raw = await resp.read()
-                return _unpack_zip(raw)
+        name = self._newest_dataset(datasets)
+        if name is None:
+            if datasets:
+                raise UpdateFailed(
+                    "No dataset with content (vehicle may be sleeping). "
+                    "Wake the vehicle via the app to generate a new snapshot."
+                )
+            raise UpdateFailed("No datasets available for this vehicle.")
 
-            return await resp.json()
-
-
-def _unpack_zip(data: bytes) -> dict[str, Any]:
-    """Extract JSON records from a ZIP snapshot."""
-    result: dict[str, Any] = {}
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            for name in zf.namelist():
-                if name.endswith(".json"):
-                    with zf.open(name) as f:
-                        try:
-                            result[name] = json.load(f)
-                        except json.JSONDecodeError:
-                            _LOGGER.warning("Could not parse %s in ZIP", name)
-    except zipfile.BadZipFile:
-        _LOGGER.error("EU Data Act returned invalid ZIP")
-    return result
+        # 3. Download + parse
+        download_url = (
+            f"{BASE_URL}/proxy_api/euda-apim/datadelivery"
+            f"/vehicles/{vin}/{identifier}/download"
+        )
+        raw = await self._download_raw(
+            download_url, {"filename": name, "type": "partial"}
+        )
+        return self._parse_dataset(raw)
